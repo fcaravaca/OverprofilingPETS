@@ -1,0 +1,2029 @@
+---
+title: "Overprofiling Study"
+author: "Francisco Caravaca"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    latex_engine: lualatex
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(fig.path = "images/")
+options(knitr.table.format = function() {
+  if (knitr::is_latex_output())
+    "latex" else "html"
+})
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readr)
+library(jsonlite)
+library(RcppSimdJson)
+```
+
+
+```{r, echo=FALSE, message=FALSE}
+users <- read_delim("Users.csv", delim=",")
+ads <- read_delim("Ads.csv", delim=",", escape_double = FALSE,escape_backslash = TRUE)
+adsInfo <- read_delim("AdsInfo.csv", delim=",",  escape_double = FALSE,escape_backslash = TRUE)
+adPostRate <- read_delim("AdPostRate.csv", delim=",",  escape_double = FALSE,escape_backslash = TRUE)
+demographic <- read_delim("Demographic.csv", delim=",",  escape_double = FALSE,escape_backslash = TRUE)
+interests <- read_delim("Interests.csv", delim=",",  escape_double = FALSE,escape_backslash = TRUE)
+landingPagesVisited <- read_delim("LandingPagesVisited.csv", delim=",",  escape_double = FALSE,escape_backslash = TRUE)
+tweetInfo <- read_delim("TweetInfo.csv", delim=",",  escape_double = FALSE,escape_backslash = TRUE)
+userAds <- read_delim("UserAds.csv", delim=",",  escape_double = FALSE,escape_backslash = TRUE, col_types = cols(
+  user_id = col_character(),
+  ad_id = col_character(),
+  ad_seen = col_datetime(format = ""),
+  valoration = col_double(),
+  guessed_platform = col_character(),
+  reasons = col_character(),
+  text = col_character(),
+  tweet_id = col_character()
+  )
+) 
+userDemographics <- read_delim("UserDemographics.csv", delim=",",  escape_double = FALSE,escape_backslash = TRUE)
+userBrowserTopics <- read_delim("UserBrowserTopics.csv", delim=",",  escape_double = FALSE,escape_backslash = TRUE)
+repeatedAds <- read_delim("repeatedAds.csv", delim=",",  escape_double = FALSE,escape_backslash = TRUE)
+
+```
+
+Load Twitter interests (categories) 
+```{r}
+
+languages <- c("english", "spanish", "french", "german", "portugese", "italian")
+
+allCategories = tibble(ID=character(), Category=character(), interest_name=character(), mainCategory=character())
+
+mainCategoriesEnglish <- NA 
+for(language in languages){
+  print(language)
+
+  twitterCategories <-  read_delim(paste("TwInterests/output-", language, ".csv", sep=""), delim=",",  escape_double = FALSE,escape_backslash = TRUE)
+  twitterCategories <- twitterCategories %>% rename(interest_name=Name)
+  mainCategories <- twitterCategories %>% group_by(Category) %>% summarise(ID=ID[1], interest_name=Category[1]) %>%
+    mutate(ID = paste0(substr(ID, 1, nchar(ID) - 3), "000"))
+  if(language == "english"){
+    mainCategoriesEnglish <- mainCategories %>% rename(mainCategory=ID, categoryName=interest_name)  %>% select(mainCategory, categoryName)
+    englishNames <- twitterCategories %>% rename(englishName=interest_name)
+  }
+  twitterCategories <- twitterCategories %>% union(mainCategories)
+  allCategories <- allCategories %>% union(twitterCategories %>%
+    mutate(mainCategory = paste0(substr(ID, 1, nchar(ID) - 3), "000"))) 
+}
+
+allCategories <- allCategories %>% left_join(mainCategoriesEnglish, by="mainCategory") %>% left_join(englishNames, by="ID")
+allCategories
+```
+
+Have the table with tehe categories and the names in english
+```{r, echo=FALSE, message=FALSE}
+
+mutate_cond <- function(.data, condition, ..., envir = parent.frame()) {
+   condition <- eval(substitute(condition), .data, envir)
+   .data[condition, ] <- .data[condition, ] %>% mutate(...)
+   .data
+}
+
+interests <- interests %>% mutate_cond(grepl("gl-topic", interest_id), platform="googleTopic")
+
+```
+Left join the user interests with the table of categories (this has to be alone with the twitter ones? )
+```{r}
+allCategoriesUnique <- allCategories %>% group_by(interest_name, englishName) %>% slice(1) %>% select(interest_name, englishName) %>% filter(!is.na(englishName))
+interests <- interests %>% left_join(allCategoriesUnique, by="interest_name")
+interests <- interests %>% mutate_cond(!is.na(englishName), interest_name=englishName) %>% select(!englishName)
+```
+Mutate conditionally the interest name if it has an englishName property 
+
+Deselect everything which is not needed
+
+
+### Ads dataset
+
+```{r}
+print(ads)
+```
+
+# Basic Dataset study
+
+
+## Ad distribution by platform
+
+```{r}
+knitr::kable(ads %>% group_by(platform) %>% summarise(n = length(platform)))
+```
+
+## Ads by user 
+
+```{r}
+print(userAds %>% group_by(user_id) %>% summarise(n = length(user_id)) %>% arrange(-n))
+```
+
+
+## Demographic info
+
+### Country distribution
+
+```{r}
+users_table <- users %>% filter(user_id %in% (userAds %>% filter(!is.na(valoration)) %>% group_by(user_id) %>% summarise(n=n()) %>% 
+  filter(n >= 60))$user_id) %>% 
+  inner_join(userDemographics, by="user_id") %>% left_join(adPostRate, by="user_id") %>%
+  filter(user_id %in% (interests %>% group_by(user_id) %>% summarise(n=n(), val=sum(!is.na(valoration))) %>%
+      filter(val >= 200 | val > n*0.95))$user_id) %>%
+  filter(user_id %in% (userAds %>% filter(!is.na(valoration)) %>% left_join(ads, by="ad_id") %>% group_by(user_id, platform) %>% summarise(total = n()) %>% group_by(user_id) %>% summarise(plats = n(), total=sum(total)) %>% 
+      filter(total > 40) %>% filter(plats >= 2))$user_id) %>% 
+  filter(!user_id %in% (interests %>% filter(platform == "garbage") %>% group_by(user_id) %>% summarise(v=mean(valoration)) %>% filter(v>2))$user_id) 
+
+print(users_table %>% group_by(country) %>% summarise(n=length((country))) %>% arrange(-n))
+```
+
+```{r countries}
+users_table %>% group_by(country) %>% summarise(n=length(country)) %>% mutate(n = n/sum(n)*100) %>% filter(!is.na(country)) %>% ggplot() + 
+  aes(x=as.factor(country), weight=n) +
+  geom_bar() +
+  theme_minimal() +
+  labs(x="Country", y="(%)") + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+### Gender distribution
+
+```{r}
+print(users_table %>% group_by(gender) %>% summarise(n=length((gender))) %>% union(users_table %>% summarise(gender="total", n=n())) )
+```
+
+
+
+```{r gender}
+users_table %>% group_by(gender) %>% summarise(n=length(gender)) %>% mutate(n = n/sum(n)*100) %>% ggplot() + 
+  aes(x=gender, weight=n) +
+  geom_bar() +
+  theme_minimal() +
+  labs(x="Gender", y="(%)")
+```
+### Age distribution
+```{r}
+print(users_table %>% group_by(age) %>% summarise(n=length((age))))
+```
+
+```{r age}
+users_table %>% group_by(age) %>% summarise(n=length(age)) %>% mutate(n = n/sum(n)*100) %>% ggplot() + 
+  aes(x=age, weight=n) +
+  geom_bar() +
+  theme_minimal() +
+  labs(x="Age ranges", y="(%)")
+```
+
+
+
+## Demographic data
+
+
+```{r}
+demographic %>% filter(user_id %in% users_table$user_id) %>% filter(!is.na(valoration)) %>% group_by(valoration) %>% summarise(n=n())
+```
+
+```{r}
+demo_summary <- demographic %>% filter(user_id %in% users_table$user_id) %>% group_by(user_id) %>% summarise(total= length(valoration), correct = sum(valoration == "yes", na.rm = T), wrong = sum(valoration == "no", na.rm = T)) %>% mutate(accuracy = round(correct/(correct+wrong), 3))
+knitr::kable(demo_summary %>% head(20))
+``` 
+
+```{r}
+demo_by_category <- demographic %>% filter(user_id %in% users_table$user_id)  %>% mutate_cond(demo_name=="Home-ownership Status", demo_name="Home ownership") %>% filter(!is.na(valoration))%>% group_by(demo_name) %>% summarise(total= length(valoration), correct = sum(valoration == "yes", na.rm = T), wrong = sum(valoration == "no", na.rm = T)) %>%  mutate(accuracy = round(correct/(correct+wrong), 3)) %>% arrange(-total)
+knitr::kable(demo_by_category)
+```
+
+```{r}
+demo_summary %>% mutate(allCorrect = total==correct) %>% group_by(allCorrect)  %>% summarise(n())
+```
+
+
+```{r}
+print(paste("Mean number of demographic data assigned: ", round(mean(demo_summary$total), 3)))
+print(paste("Mean rate of correct data: ", round(mean(demo_summary$accuracy, na.rm=T), 3)))
+```
+
+
+## Interests
+
+Interest sample table
+```{r}
+interests %>% filter(valoration != "NULL") %>% sample_n(10)
+```
+### Total Interests assigned by platform
+
+```{r totalInterestsByPlaform}
+interests_filtered <- interests %>% filter(user_id %in% users_table$user_id)
+interests_filtered  %>% filter(!platform %in% c("garbage", "browser")) %>% group_by(platform) %>% summarise(n=length(platform)) %>% ggplot() + 
+  aes(x=platform, weight=n) +
+  geom_bar() +
+  theme_minimal() +
+  labs(x="Platform", y="# of interests")
+```
+
+```{r interestsAssignedToEachUser}
+interests_filtered  %>% filter(!platform %in% c("garbage", "browser")) %>% filter(platform != "google")  %>% mutate_cond(platform=="googleTopic", platform="google") %>% group_by(user_id, platform) %>% summarise(n=length(platform)) %>% ggplot() + 
+  aes(x=platform, y=n) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(x="Platform", y="# of interests assigned to each person")
+```
+
+
+### Interests classifications
+
+
+#### ECDF with percentage of interests classified
+
+```{r percentageOfValuatedInterestsECDF}
+interests_filtered %>% mutate(v=!is.na(valoration)) %>% group_by(user_id) %>% summarise(valorated=sum(v), all=n(), rate=sum(v==TRUE)/n()) %>% ggplot() +
+  stat_ecdf(aes(x=rate), geom="step") + theme_bw() + labs(x="Percentage of Interests evaluated", y="ECDF") + xlim(c(0,1))
+```
+
+
+```{r ecdfIntetrestsValuated}
+interests_filtered %>% mutate(v=!is.na(valoration)) %>% group_by(user_id) %>% summarise(valorated=sum(v), all=n(), rate=sum(v==TRUE)/n()) %>% ggplot() +
+  stat_ecdf(aes(x=valorated), geom="step") + theme_bw() + labs(x="Interests valuated")
+```
+
+
+
+#### Interests classificated by platform, stadistical (using all interests)
+```{r}
+classified_interests <- interests_filtered %>% filter(valoration != "NULL")
+knitr::kable(
+  classified_interests%>% group_by(platform) %>% summarise(n=length(platform), mean_valoration = mean(valoration), median_valoration=median(valoration), var_valoration=var(valoration))
+)
+```
+
+
+#### Interests classificated by platform, stadistical (averaging results by user)
+
+```{r}
+
+interests_plat <- classified_interests %>% group_by(user_id,platform) %>% summarise(n=length(platform), mean_valoration = mean(valoration), median_valoration=median(valoration), var_valoration=var(valoration))
+
+knitr::kable(interests_plat %>% group_by(platform) %>% summarise(n=sum(n), mean_valoration = mean(mean_valoration), median_valoration=mean(median_valoration), var_valoration=mean(var_valoration, na.rm=T)))
+```
+
+```{r interestsScoreFromEachUser}
+interests_plat %>% filter(n >= 10) %>% filter(platform != "garbage") %>% filter(platform != "google") %>% mutate_cond(platform=="browser", platform="dummy") %>% mutate_cond(platform=="googleTopic", platform="google") %>% ggplot() + geom_boxplot(aes(x=platform, y=mean_valoration)) + ylim(1,5) + labs(x="Platform", y="Mean score of each user") + theme_bw()
+```
+
+```{r interestsScoreFromEachUserViolin}
+interests_plat %>% filter(n >= 10) %>% filter(platform != "garbage") %>% ggplot() + geom_violin(aes(x=platform, y=mean_valoration)) + ylim(1,5) + labs(x="Platform", y="Mean score of each user")
+```
+
+
+```{r interestsResponse}
+classified_interests %>% filter(platform != "garbage") %>% group_by(valoration) %>% summarise(n=length(valoration)) %>% mutate(n = n/sum(n)) %>% ungroup %>% ggplot(aes(x=valoration, y=n)) +
+  geom_bar(position="dodge", stat="identity")+ theme_minimal() + labs(y="Response Ratio", x="Response Value: range [1-5]", fill="Platform")
+```
+
+```{r classifiedInterestsByValoration}
+classified_interests %>% filter(platform != "garbage") %>% group_by(platform,valoration) %>% summarise(n=length(platform)) %>% group_by(platform) %>% mutate(n = n/sum(n)) %>% ungroup %>% ggplot(aes(x=valoration, y=n, fill=platform)) +
+  geom_bar(position="dodge", stat="identity")+ theme_minimal() + labs(y="Response Ratio", x="Response Value: range [1-5]", fill="Platform") + theme(legend.position = "bottom") +facet_wrap(~platform)
+```
+
+```{r classifiedInterestsByPlatform}
+classified_interests %>% filter(platform != "garbage") %>% filter(platform != "google") %>% mutate_cond(platform=="browser", platform="dummy") %>% mutate_cond(platform=="googleTopic", platform="google") %>% group_by(platform,valoration) %>% summarise(n=length(platform)) %>% group_by(platform) %>% mutate(n = n/sum(n)) %>% ungroup %>% ggplot(aes(x=valoration, y=n)) +
+  geom_bar(position="dodge", stat="identity")+ theme_minimal() + labs(y="Response Ratio", x="Response Value: range [1-5]", fill="Platform") + facet_wrap(~platform, ncol=3) + theme(legend.position = "bottom")
+```
+
+
+
+Worst interests:
+
+```{r}
+knitr::kable(classified_interests %>% group_by(interest_name) %>% summarise(n= length(interest_name), valoration = mean(valoration)) %>% arrange(valoration) %>% filter(n > 4) %>% head(20))
+```
+
+Best interests 
+
+```{r}
+knitr::kable(classified_interests %>% group_by(interest_name) %>% summarise(n= length(interest_name), valoration = mean(valoration)) %>% arrange(-valoration) %>% filter(n > 4) %>% head(20))
+```
+
+
+
+#### Interests classification stadistical info
+
+```{r}
+knitr::kable(classified_interests %>% filter(valoration != "NULL") %>% group_by(platform) %>% summarise(n=length(platform), mean_valoration=mean(valoration), var=var(valoration), median=median(valoration)))
+```
+
+```{r}
+
+class_int2_test <- classified_interests %>% filter(platform != "garbage") %>% filter(platform != "google") %>% mutate_cond(platform=="browser", platform="baseline") %>% mutate_cond(platform=="googleTopic", platform="google")
+
+
+model <- lm(valoration ~ platform, data = class_int2_test)
+summary(model)
+
+
+``` 
+
+```{r}
+anova(model)
+```
+
+```{r}
+contingency_table <- table(class_int2_test$platform, class_int2_test$valoration)
+chi_squared_result <- chisq.test(contingency_table)
+
+chi_squared_result
+```
+
+```{r}
+class_int2_test2 <- interests_plat %>% filter(n >= 10) %>% filter(platform != "garbage") %>% filter(platform != "google") %>% mutate_cond(platform=="browser", platform="baseline") %>% mutate_cond(platform=="googleTopic", platform="google") %>% filter(platform!="garbage") %>% ungroup
+
+model_anova <- aov(median_valoration ~ platform, data = class_int2_test2)
+summary(model_anova)
+
+model_lm <- lm(mean_valoration ~ platform, data = class_int2_test2)
+summary(model_lm)
+```
+
+
+```{r}
+model_anova <- aov(mean_valoration ~ platform + user_id, data = class_int2_test2)
+summary(model_anova)
+
+model_anova <- aov(mean_valoration ~ platform + user_id, data = class_int2_test2)
+summary(model_anova)
+```
+
+
+```{r}
+class_int2_test2 <- interests_plat %>% filter(n >= 10) %>% filter(platform != "garbage") %>% filter(platform != "google") %>% mutate_cond(platform=="browser", platform="baseline") %>% mutate_cond(platform=="googleTopic", platform="google") %>% filter(platform!="garbage") %>% ungroup
+
+model_anova <- aov(median_valoration ~ platform, data = class_int2_test2)
+summary(model_anova)
+
+model_lm <- lm(mean_valoration ~ platform, data = class_int2_test2)
+summary(model_lm)
+```
+
+
+the #### Interests Fatigue
+
+```{r InterestsFatigue}
+
+breakpoints <- seq(0, 1, length.out = 11)
+
+interests_fatigue <- classified_interests %>% arrange(valoration_timestamp)
+
+interests_fatigue <- interests_fatigue %>% mutate(valoration_timestamp = as.POSIXct(valoration_timestamp, format = "%Y-%m-%d %H:%M:%OS", tz = "UTC"))
+
+interests_fatigue$seconds <- as.integer(interests_fatigue$valoration_timestamp)
+interests_fatigue$milliseconds <-second(interests_fatigue$valoration_timestamp)
+interests_fatigue$milliseconds <- round(interests_fatigue$milliseconds - floor(interests_fatigue$milliseconds),3)
+interests_fatigue$epoch <- interests_fatigue$seconds + interests_fatigue$milliseconds
+interests_fatigue <-  interests_fatigue %>% group_by(user_id) %>% mutate(epoch_b = epoch - lag(epoch)) %>% filter(!is.na(epoch_b)) %>% filter(epoch_b < 60) %>% filter(epoch_b > 0.15) # Filtering below 0.15 as data was at first recorded as recieved by the server instead of the user generated epoch
+interests_fatigue <- interests_fatigue %>% mutate(n=1:n()) %>% mutate(interval= cut(n/max(n), breaks=breakpoints, labels=sprintf("%d%%", seq(10, 100, by = 10)), include.lowest = TRUE))
+
+
+interests_fatigue %>% ggplot(aes(x=interval, y=epoch_b)) + geom_boxplot()
+
+```
+
+
+
+```{r}
+interests_fatigue %>% group_by(user_id, interval) %>% summarise(epoch_b=median(epoch_b)) %>% filter(epoch_b < 5) %>% ggplot(aes(x=interval, y=epoch_b)) + geom_boxplot() + ylim(c(0,5)) + theme_bw() + labs(x="Interval", y="Time between clicks (by user)")
+```
+
+```{r}
+interests_fatigue %>% filter(epoch_b < 60) %>% ggplot(aes(x=interval, y=epoch_b)) + geom_boxplot() + ylim(c(0,4)) + theme_bw() 
+```
+
+
+```{r}
+
+interests_fatigue %>%
+  group_by(user_id, interval) %>%
+  summarise(epoch_b = median(epoch_b)) %>%
+  group_by(interval) %>%
+  mutate(median_point = median(epoch_b)) %>%
+  ggplot(aes(x = interval, y = epoch_b)) +
+  geom_boxplot() +
+  geom_point(aes(y = median_point), color = "red", size = 2) +
+  theme_bw()
+
+
+```
+
+
+
+p-value of 0.49 comparing inter-click time between interval and epoch_b
+
+```{r}
+
+fatigue_tib <- interests_fatigue %>%
+  group_by(user_id, interval) %>%
+  summarise(epoch_b = median(epoch_b))
+
+model_anova <- aov(epoch_b ~ interval, data = fatigue_tib)
+summary(model_anova)
+```
+
+```{r}
+q10 = quantile(interests_fatigue$epoch_b, 0.01)
+q90 = quantile(interests_fatigue$epoch_b, 0.99)
+
+model_anova <- aov(epoch_b ~ n, data=(interests_fatigue %>% 
+                                        filter(epoch_b < q90) %>%
+                                        filter(epoch_b > q10) %>%
+                                        mutate(n = n/max(n)))
+                   )
+summary(model_anova)
+```
+
+
+
+# Ads reasons
+
+
+```{r AdsByPlatform}
+userAds_filtered <- userAds %>% filter(user_id %in% users_table$user_id) 
+
+userAds_filtered %>% left_join(ads, by="ad_id") %>% filter(platform!="youtube") %>% group_by(platform) %>% summarise(n=length(platform)) %>% ggplot() + 
+  aes(x=platform, weight=n) +
+  geom_bar() +
+  theme_minimal() +
+  labs(x="Platform", y="# of Ads")
+
+```
+
+
+# Data desription
+
+```{r}
+ads_data <- userAds_filtered %>% left_join(ads, by="ad_id") %>% filter(platform!="youtube") 
+```
+
+
+
+
+## Google
+
+
+```{r}
+google_ads <- userAds_filtered %>% left_join(ads, by="ad_id") %>% filter(platform=="google") %>% filter(!is.na(reasons)) %>% filter(reasons!="[]")
+```
+
+
+
+```{r}
+
+
+google_reasons <- tibble(reason=character(), times=numeric())
+
+reasons_g <- unlist(fparse(google_ads$reasons))
+google_reasons <- tibble(reason =reasons_g) %>% group_by(reason) %>% summarise(times = length(reason))
+
+knitr::kable(google_reasons %>% arrange(-times) %>% head(20))
+```
+
+
+## Facebook
+
+```{r}
+
+fb_ads <- userAds_filtered %>% left_join(ads, by="ad_id") %>% filter(platform=="facebook") %>% filter(!is.na(reasons)) %>% filter(reasons!="[]")
+
+#fb_reasons <- tibble(reason=character(), times=numeric())
+
+#fb_reasons <- tibble(reason = ) %>% group_by(reason) %>% summarise(times = length(reason))
+
+reasons_fb_array <- unlist(fparse(fb_ads$reasons))
+
+reasons_array <- c()
+for(reason_t in reasons_fb_array){
+    replace <- c("set their gender to [a-z]* and age", "a primary location", "set their age",  "communicated in", "been included in a category ", "been on a hashed list ", "visited ([a-z]|[-]|[']|[ ]|[.]|[&]|[%])+ website", "interacted with",  "set their education level ")
+    added = F
+    for(replace_value in replace){
+      if(grepl(replace_value, tolower(reason_t))){
+        reasons_array <- append(reasons_array,replace_value)
+        added = T
+        next
+      }
+    }
+    if(!added){
+      reasons_array <- append(reasons_array, reason_t)
+    }
+}
+
+
+fb_r <- tibble(reason=reasons_array) %>% group_by(reason) %>% summarise(times = length(reason)) %>% arrange(-times)
+knitr::kable(fb_r %>% head(20))
+```
+
+
+
+## Twitter
+
+```{r}
+
+tw_ads <- userAds_filtered %>% left_join(ads, by="ad_id") %>% filter(platform=="twitter") %>% filter(!is.na(reasons)) %>% filter(reasons!="[]")
+
+reasons_tw <- unlist(fparse(tw_ads$reasons))
+tw_reasons <- tibble(reason = reasons_tw) %>% group_by(reason) %>% summarise(times = length(reason))
+
+tw_reasons <- tw_reasons %>% mutate(withAge = grepl(".*\\b([1-9]|[1-9][0-9])\\b.*", reason), location=grepl(":", reason))
+tw_reasons <- tw_reasons %>% mutate(locationWithGender = grepl("men *", reason), location=grepl(":", reason))
+
+
+tw_reasons <- tw_reasons %>% mutate_cond(withAge, reason="Age") %>%
+  mutate_cond(location, reason="Location") %>%
+  mutate_cond(withAge & location, reason="Age and location") %>% mutate_cond(locationWithGender, reason="Gender and location") %>% group_by(reason) %>% summarise(times = sum(times))
+
+knitr::kable(tw_reasons %>% arrange(-times))
+```
+
+
+
+```{r}
+tw_ads <- userAds_filtered %>% left_join(ads, by="ad_id") %>% filter(platform=="twitter") %>% filter(!is.na(reasons)) %>% filter(reasons!="[]")
+
+
+reasons_fb_array <- unlist(fparse(tw_ads$reasons))
+
+reasons_array <- c()
+for(reason_t in reasons_fb_array){
+    replace <- c(".*\\b([1-9]|[1-9][0-9])\\b.",": ", "a primary location", "men *",  "people who speak", "people who are located here", "been on a hashed list ", "visited ([a-z]|[-]|[']|[ ]|[.]|[&]|[%])+ website", "interacted with",  "set their education level ")
+    added = F
+    for(replace_value in replace){
+      if(grepl(replace_value, tolower(reason_t))){
+        reasons_array <- append(reasons_array,replace_value)
+        added = T
+        next
+      }
+    }
+    if(!added){
+      reasons_array <- append(reasons_array, reason_t)
+    }
+}
+fb_r <- tibble(reason=reasons_array) %>% group_by(reason) %>% summarise(times = length(reason)) %>% arrange(-times)
+knitr::kable(fb_r)
+
+```
+
+
+
+## LinkedIn
+
+```{r}
+
+li_ads <- userAds_filtered %>% left_join(ads, by="ad_id") %>% filter(platform=="linkedin") %>% filter(!is.na(reasons)) %>% filter(reasons!="[]")
+
+
+li_r <- str_split(unlist(fparse(li_ads$reasons)), "wants to reach ", simplify = T)[,1]
+li_r <- str_split(li_r, "\\.", simplify = T)[,1]
+
+
+reasons_array <- c()
+for(reason_li in li_r){
+    replace <- c("Your profile location is", "Your current employer has", "You are a member of",
+                 "Your current job title is", "Your overall work experience is", "Your current employer is",
+                 "You have a Bachelor",  "Your job titles include",
+              "You studied the field of", "Your 1st-degree connections work at",
+                 "You attended ", "You have either interacted with", "Your employers include "
+                 
+                )
+    added = F
+    for(replace_value in replace){
+      if(grepl(replace_value, (reason_li))){
+        reasons_array <- append(reasons_array,replace_value)
+        added = T
+        next
+      }
+    }
+    if(!added){
+      reasons_array <- append(reasons_array, reason_li)
+    }
+}
+
+li_reasons <- tibble(reason = reasons_array) %>% group_by(reason) %>% 
+     group_by(reason) %>% summarise(times = length(reason)) %>% arrange(-times)
+
+knitr::kable(li_reasons)
+```
+
+
+Skills linkedin targeting
+
+```{r}
+knitr::kable(li_reasons %>% filter(grepl("Your skills include", reason)))
+```
+
+Interests linkedin targeting
+
+```{r}
+knitr::kable(li_reasons %>% filter(grepl("Your interests include", reason)) )
+```
+
+
+```{r}
+library(urltools)
+clean_url <- function(url){
+  domain <- domain(url)
+  return(domain)
+}
+
+
+platformsLandinPages <- userAds_filtered  %>% left_join(ads) %>% mutate(domain_name = clean_url(landing_page)) %>% group_by(platform, domain_name) %>% summarise(n=n()) %>% filter(!is.na(domain_name)) %>% arrange(-n) %>% filter(!domain_name %in% c("www.facebook.com", "www.linkedin.com", "twitter.com")) %>% ungroup
+
+pages_to_obtain <- platformsLandinPages %>% group_by(domain_name) %>% sample_n(1) %>% arrange(-n) %>% select(domain_name)
+write.csv(pages_to_obtain, "pages_to_get_data.csv", row.names=F, quote = F)
+
+```
+
+
+```{r}
+domains_pages <- read.csv("domainsTopics.tsv", sep = "\t")
+
+domains_pages_separated <- domains_pages %>%
+  separate_rows(topics, sep = " (?=\\d{1,3}\\.)") %>% # Splitting by a space followed by three digits and a dot
+  mutate(topics = str_trim(topics)) %>% rename(topic=topics)#
+
+pages_topics <- platformsLandinPages %>% left_join(domains_pages_separated) %>% group_by(platform, topic) %>% summarise(n=n()) %>% arrange(-n) %>% filter(topic!="")
+
+```
+
+
+```{r}
+userAds_filtered %>% left_join(ads) %>% group_by(platform, author) %>% summarise(n=n()) %>% arrange(-n)
+```
+
+
+# Ad classification
+
+
+```{r}
+ad_class <- userAds_filtered %>% filter(!is.na(valoration)) %>% filter(!is.na(guessed_platform)) %>% left_join(ads, by="ad_id") 
+cat(paste("Total classified ads:", dim(ad_class)[1],"\n"))
+cat(paste("Correct classified ads:", sum(ad_class$guessed_platform == ad_class$platform, na.rm=T), "(", sum(ad_class$guessed_platform == ad_class$platform, na.rm=T)/dim(ad_class)[1]*100, "%)"))
+
+```
+
+```{r}
+knitr::kable(ad_class %>% group_by(platform) %>% summarise(total = length(platform), correct= sum(platform==guessed_platform), rate=correct/total, valoration=mean(valoration)))
+```
+#### Quality
+```{r}
+ad_class %>% filter(platform!="youtube") %>% mutate(goodAd = valoration > 2) %>% group_by(platform, goodAd) %>% summarise(n=n()) %>% spread(goodAd, n) %>%
+  mutate(score = `TRUE`/(`FALSE`+`TRUE`))
+
+```
+
+
+```{r}
+knitr::kable(ad_class %>% filter(platform!="youtube") %>% group_by(platform) %>% summarise(sum(valoration == 1)/n(), sum(valoration <= 2)/n(), sum(valoration <= 3)/n(), sum(valoration >= 4)/n()) )
+```
+
+
+
+```{r}
+knitr::kable(ad_class %>% group_by(guessed_platform) %>% summarise(total = length(guessed_platform), correct= sum(platform==guessed_platform), rate=correct/total, valoration=mean(valoration)))
+```
+
+```{r}
+
+knitr::kable(ad_class %>% mutate(isCorrect = guessed_platform == platform) %>% group_by(platform,isCorrect) %>% summarise(Ads=n(), Valuation=mean(valoration)))
+
+```
+
+
+```{r}
+interests_user_summary <- interests %>% filter(user_id %in% users_table$user_id) %>% group_by(user_id) %>% summarise(interest_valuation = mean(valoration, na.rm=TRUE))
+
+user_summary <- ad_class %>% group_by(user_id, platform, guessed_platform) %>% summarise(total = length(guessed_platform), correct= sum(platform==guessed_platform), rate=correct/total, ad_valuation=mean(valoration)) %>% arrange(-total) %>% left_join(interests_user_summary, by="user_id")
+interests_user_summary
+```
+
+
+```{r}
+user_summary %>% filter(!is.na(interest_valuation )) %>% pivot_longer(c(7,8), names_to="valuation_type", values_to="valuation") %>% ggplot() + 
+  geom_boxplot(aes(x=valuation_type, y=valuation ))
+```
+
+
+## Ad classificated rate by platform and valoration
+
+```{r ClassificatedAds}
+
+ad_class %>% group_by(valoration) %>% summarise(n=n()) %>% ggplot(aes(x=valoration, y=n)) +  geom_bar(position="dodge", stat="identity")+ theme_minimal() + labs(y="Number of responses", x="Response Value: range [1-5]")
+
+```
+
+
+
+```{r adsClassificatedByPlatformRate}
+ad_class %>% filter(platform!="youtube") %>% group_by(platform,valoration) %>% summarise(n=length(platform)) %>% group_by(platform) %>% mutate(n = n/sum(n)) %>% ungroup %>% ggplot(aes(x=valoration, y=n, fill=platform)) +
+  geom_bar(position="dodge", stat="identity")+ theme_minimal() + labs(y="Response Ratio", x="Response Value: range [1-5]", fill="Platform") + theme(legend.position = "bottom")
+```
+
+```{r adsClassificatedByPlatformPlat}
+ad_class %>% filter(platform!="youtube") %>% group_by(platform,valoration) %>% summarise(n=length(platform)) %>% group_by(platform) %>% mutate(n = n/sum(n)) %>% ungroup %>% ggplot(aes(x=valoration, y=n)) +
+  geom_bar(position="dodge", stat="identity")+ theme_minimal() + labs(y="Response Ratio", x="Response Value: range [1-5]", fill="") + theme(legend.position = "bottom") + facet_wrap(~platform)
+```
+
+
+```{r}
+ad_class %>% filter(platform!="youtube") %>% group_by(platform,user_id) %>% summarise(valuation = mean(valoration)) %>% ggplot(aes(x=platform, y=valuation, fill=platform)) + geom_boxplot() + theme_minimal() + theme(legend.position = "bottom")
+```
+
+
+
+# Ads with classificated interests
+
+
+```{r}
+
+
+get_interest_valoration <- function(interest, user_id_t){
+  
+  if(grepl("Your interests include ", interest)){
+    interest <- str_split(str_split(interest,"[.] ", simplify=T)[1], "include ",simplify=T)[2]
+  }
+
+  
+  query <- classified_interests %>% filter(user_id == user_id_t) %>% filter(tolower(interest_name) == tolower(interest))
+  if(dim(query)[1] == 0){
+    translated_row <- allCategories %>% filter(interest_name==interest) %>% slice(1)
+    if(dim(translated_row)[1] != 0){
+      if(!is.na(translated_row$englishName[1])){
+        if(translated_row$englishName[1] != interest){
+          translatedValoration <- get_interest_valoration(translated_row$englishName[1], user_id_t)
+          return(c(translatedValoration, translated_row$englishName[1]))
+        } 
+      }
+    }
+    if(grepl("[ (]", interest)){
+      specific_category <- (get_interest_valoration(str_split(interest,"[ (]", simplify=T)[1],user_id_t))
+      if(is.na(specific_category[1])){
+        result <- str_match(interest, "\\((.*?)\\)")
+
+        # Access the extracted text
+        if (!is.na(result[1, 2])) {
+          extracted_text <- result[1, 2]
+          info <- get_interest_valoration(extracted_text, user_id_t)
+          return(c(info, extracted_text))
+        }
+      }else{
+        return(c(specific_category[1], specific_category[2]))
+      }
+    }
+    return(c(NA, NA))
+    
+  }else{
+    return(c(query$valoration[1], interest))
+  }
+}
+
+#userAds %>% left_join(ads, by="ad_id")
+ads_with_reasons <- userAds_filtered  %>% left_join(ads, by="ad_id") %>% filter(!is.na(reasons)) %>% filter(reasons != "[]") %>% mutate(ad_valoration_by_interests=0)
+ads_with_reasons_tab <- ads_with_reasons %>% slice(0) %>% mutate(interest_name=character())
+for(i in 1:dim(ads_with_reasons)[1]){
+
+  ad <- ads_with_reasons %>% slice(i)
+  reasons <- fromJSON(ad$reasons)
+  current_user <- ad$user_id
+  current_ad_id <- ad$ad_id
+  added <- 0
+  interest_mean <- 0
+  for(reason in reasons){
+    ret <- get_interest_valoration(reason, current_user)
+    reason_valoration <- ret[1]
+    interest_name <- ret[2]
+    if(!is.na(reason_valoration)){
+      interest_mean <- interest_mean + as.integer(reason_valoration)
+      added <- added + 1
+      ads_with_reasons_tab <- ads_with_reasons_tab %>% union(
+        ad %>% mutate( ad_valoration_by_interests = as.integer(reason_valoration), interest_name=interest_name)
+      )
+    }
+  }
+  if(added > 0){
+    ads_with_reasons <- ads_with_reasons %>% mutate_cond(ad_id == current_ad_id & user_id == current_user, ad_valoration_by_interests = interest_mean/added)
+    
+  }
+}
+ads_with_reasons_all <- ads_with_reasons
+ads_with_reasons <- ads_with_reasons %>% filter(ad_valoration_by_interests > 0) %>% filter(platform != "google") 
+ads_with_reasons %>% filter(!is.na(valoration)) %>% pivot_longer(c(4,13), names_to="valoration_type", values_to="valoration") %>% ggplot() + 
+  geom_boxplot(aes(x=valoration_type, y=valoration, fill=platform)) + theme_minimal()
+
+```
+
+
+```{r}
+ads_with_reasons_tab %>% group_by(platform, ad_id, user_id) %>% sample_n(1) %>% group_by(platform) %>% summarise(n())
+```
+
+
+```{r}
+interestCategories <- read.csv("allItemsCategories.csv")
+```
+
+
+
+```{r}
+knitr::kable(ads_with_reasons_tab %>% group_by(platform, interest_name) %>% summarise(n=n()) %>% arrange(-n) %>% left_join(interestCategories) )
+```
+
+```{r}
+ex <- ads_with_reasons_tab  %>%   left_join(interestCategories  %>% group_by(interest_name) %>% sample_n(1)) %>% group_by(Category, platform) %>% summarise(n=n())
+ex
+```
+
+```{r}
+ex %>% filter(platform != "google") %>% spread(platform, n)
+```
+
+
+```{r}
+knitr::kable(ads_with_reasons_tab %>% left_join(interestCategories) %>% filter(is.na(Category)) %>% select(interest_name) %>% group_by(interest_name) %>% sample_n(1))
+```
+
+
+
+
+```{r}
+knitr::kable(ads_with_reasons_tab  %>% group_by(interest_name) %>% summarise(n=n()) %>% arrange(-n))
+```
+
+
+
+
+
+
+```{r PlotWithInterestsAdValuationPrev}
+
+order = c( "General Ad Valuation", "Ad Valuation", "Ad Valuation By Interests", "General Interest Valuation")
+
+interests_ad_v <- ads_with_reasons %>%
+  select(platform, valoration, ad_valoration_by_interests) %>%
+  mutate(ad_valoration_by_interests = round(ad_valoration_by_interests)) %>%
+  pivot_longer(c(2,3), names_to="valuation_type", values_to="valuation") %>%
+  group_by(valuation_type, valuation, platform) %>%
+  summarise(n=n()) %>% filter(!is.na(valuation)) %>% ungroup %>% group_by(valuation_type, platform) %>%
+  summarise(n = n, valuation=valuation) %>% union(
+    ad_class  %>%  filter(platform!="youtube") %>%  group_by(platform,valoration) %>% summarise(n=n()) %>% group_by(platform) %>% mutate(n = n/sum(n)) %>% rename(valuation = valoration) %>%
+      mutate(valuation_type="general_ad_valuation") %>% select(valuation_type, platform, n, valuation) %>%
+      filter(platform!="google")
+  ) %>% union(
+        classified_interests  %>%  group_by(platform,valoration) %>% summarise(n=n()) %>% rename(valuation = valoration) %>%
+      mutate(valuation_type="general_int_valuation") %>% select(valuation_type, platform, n, valuation) %>%
+      filter(platform!="google") %>% filter(platform!="googleTopic") %>% filter(platform!="garbage") %>% filter(platform!="browser")
+  ) %>% 
+    mutate_cond(valuation_type=="valoration", valuation_type="Ad Valuation") %>%
+    mutate_cond(valuation_type=="ad_valoration_by_interests", valuation_type="Ad Valuation By Interests") %>%
+    mutate_cond(valuation_type=="general_ad_valuation", valuation_type="General Ad Valuation") %>%
+      mutate_cond(valuation_type=="general_int_valuation", valuation_type="General Interest Valuation") %>%
+   mutate(valuation_type =factor(valuation_type, levels=order) ) %>% filter(valuation_type %in% c("Ad Valuation By Interests", "General Interest Valuation")) 
+
+ 
+ interests_ad_v <- classified_interests %>% select(platform, valoration) %>% mutate(valuation_type="General Interest Valuation") %>% 
+   bind_rows(
+ads_with_reasons %>%
+    select(platform, ad_valoration_by_interests) %>% mutate(valoration = round(ad_valoration_by_interests)) %>% select(platform, valoration) %>% mutate(valuation_type="Ad Valuation By Interests")
+   )
+
+model_anova <- aov(valoration ~  valuation_type + platform , data = interests_ad_v)
+summary(model_anova) 
+ 
+ contingency_table <- table(interests_ad_v$valuation_type, interests_ad_v$valoration)
+chi_squared_result <- chisq.test(contingency_table)
+
+
+```
+
+
+```{r PlotWithInterestsAdValuation}
+
+order = c( "General Ad Valuation", "Ad Valuation", "Ad Valuation By Interests", "General Interest Valuation")
+
+ads_with_reasons %>%
+  select(platform, valoration, ad_valoration_by_interests) %>%
+  mutate(ad_valoration_by_interests = round(ad_valoration_by_interests)) %>%
+  pivot_longer(c(2,3), names_to="valuation_type", values_to="valuation") %>%
+  group_by(valuation_type, valuation, platform) %>%
+  summarise(n=n()) %>% filter(!is.na(valuation)) %>% ungroup %>% group_by(valuation_type, platform) %>%
+  summarise(n = n/sum(n), valuation=valuation) %>% union(
+    ad_class  %>%  filter(platform!="youtube") %>%  group_by(platform,valoration) %>% summarise(n=n()) %>% group_by(platform) %>% mutate(n = n/sum(n)) %>% rename(valuation = valoration) %>%
+      mutate(valuation_type="general_ad_valuation") %>% select(valuation_type, platform, n, valuation) %>%
+      filter(platform!="google")
+  ) %>% union(
+        classified_interests  %>%  group_by(platform,valoration) %>% summarise(n=n()) %>% group_by(platform) %>% mutate(n = n/sum(n)) %>% rename(valuation = valoration) %>%
+      mutate(valuation_type="general_int_valuation") %>% select(valuation_type, platform, n, valuation) %>%
+      filter(platform!="google") %>% filter(platform!="googleTopic") %>% filter(platform!="garbage") %>% filter(platform!="browser")
+  ) %>% 
+    mutate_cond(valuation_type=="valoration", valuation_type="Ad Valuation") %>%
+    mutate_cond(valuation_type=="ad_valoration_by_interests", valuation_type="Ad Valuation By Interests") %>%
+    mutate_cond(valuation_type=="general_ad_valuation", valuation_type="General Ad Valuation") %>%
+      mutate_cond(valuation_type=="general_int_valuation", valuation_type="General Interest Valuation") %>%
+   mutate(valuation_type =factor(valuation_type, levels=order) ) %>% 
+  
+  ggplot(aes(x=valuation, y=n, fill=valuation_type)) + geom_bar(position="dodge", stat="identity") + facet_grid(c(~platform, ~valuation_type))+ theme_bw() + theme(legend.position="none") +
+  labs(fill="Valuation Type", y="Rate", x="Valuation")
+
+
+```
+
+
+
+```{r}
+ads_with_reasons %>% filter(platform != "google") %>% 
+  select(platform, valoration, ad_valoration_by_interests) %>%
+  mutate(ad_valoration_by_interests = round(ad_valoration_by_interests)) %>%
+  pivot_longer(c(2,3), names_to="valuation_type", values_to="valuation") %>%
+  group_by(valuation_type, valuation, platform) %>%
+  summarise(n=n()) %>% filter(!is.na(valuation)) %>% ungroup %>% group_by(valuation_type, platform) %>%
+  summarise(n = n/sum(n), valuation=valuation) %>% union(
+    ad_class  %>%  filter(platform!="youtube") %>%  group_by(platform,valoration) %>% summarise(n=n()) %>% group_by(platform) %>% mutate(n = n/sum(n)) %>% rename(valuation = valoration) %>%
+      mutate(valuation_type="general_ad_valuation") %>% select(valuation_type, platform, n, valuation) %>%
+      filter(platform!="google")
+  ) %>% union(
+    ads_with_reasons_tab %>% filter(platform != "google") %>% inner_join(landingPagesVisited, by=c("user_id", "ad_id")) %>% group_by(platform,ad_valoration_by_interests) %>% summarise(n=n()) %>% group_by(platform) %>% mutate(n = n/sum(n)) %>% mutate(valuation_type="interests_clicked_ads") %>% rename(valuation=ad_valoration_by_interests) %>% select(valuation_type, platform, n, valuation)
+  ) %>% 
+    mutate_cond(valuation_type=="valoration", valuation_type="Ad Valuation") %>%
+    mutate_cond(valuation_type=="ad_valoration_by_interests", valuation_type="Ad Valuation By Interests") %>%
+    mutate_cond(valuation_type=="general_ad_valuation", valuation_type="General Ad Valuation") %>%
+      mutate_cond(valuation_type=="interests_clicked_ads", valuation_type="Interest Valuation in Clicked Ads") %>%
+  
+  ggplot(aes(x=valuation, y=n, fill=factor(valuation_type, levels=c("Ad Valuation", "Ad Valuation By Interests", "General Ad Valuation")))) + geom_bar(position="dodge", stat="identity") + facet_grid(c(~platform, ~valuation_type))+ theme_bw() + theme(legend.position="bottom") +
+  labs(fill="Valuation Type", y="Rate", x="Valuation")
+
+
+```
+
+
+```{r}
+ads_with_reasons  %>% group_by(ad_id, user_id, platform) %>% summarise(n()) %>% group_by(platform) %>% summarise(n())
+```
+
+```{r}
+ads_with_reasons  %>% group_by(ad_id, user_id, platform) %>% summarise(n()) %>% group_by(platform) %>% summarise(n())
+```
+
+# Ad post rate
+
+
+```{r}
+
+ad_post_rate_summary <- tibble(platform=character(), user_id=character(), posts=integer(), rate=double())
+
+for(i in 1:dim(adPostRate)[1]){
+  
+  user_data <- adPostRate %>% slice(i)
+  current_user_id <- user_data$user_id
+  info <- fromJSON(user_data$info)
+  if(info$facebook$posts > 20){
+    ad_post_rate_summary <- ad_post_rate_summary %>% union(tibble(platform="facebook", posts=info$facebook$posts, user_id=current_user_id, rate=info$facebook$ads/info$facebook$posts*100))
+  }
+  
+  if(info$linkedin$posts > 20){
+        ad_post_rate_summary <- ad_post_rate_summary %>% union(tibble(platform="linkedin", posts=info$linkedin$posts,user_id=current_user_id, rate=info$linkedin$ads/info$linkedin$posts*100))
+  }
+  if(info$twitter$posts > 20){
+        ad_post_rate_summary <- ad_post_rate_summary %>% union(tibble(platform="twitter", posts=info$twitter$posts, user_id=current_user_id, rate=info$twitter$ads/info$twitter$posts*100))
+  }
+  
+  
+}
+
+ad_post_rate_summary %>% filter(rate > 0) %>% ggplot() + geom_boxplot(aes(x=platform, y=rate)) + labs(x="Platfrom", y="Number of ad posts every 100 posts")
+
+```
+
+
+```{r}
+post_rate_interest_rating <- ad_post_rate_summary %>% inner_join(interests_plat, by=c("user_id", "platform"))
+post_rate_interest_rating %>% filter(posts > 0) %>% filter(n > 20) %>% ggplot() + geom_point(aes(y=mean_valoration, x=log10(posts), color=platform))
+```
+
+
+```{r}
+post_rate_interest_rating %>% filter(posts > 0 & rate > 0) %>% ggplot() + geom_point(aes(x=log10(posts), y=rate))
+```
+
+
+
+# Visited or clicked ads
+
+
+
+
+
+
+
+
+
+# Browsing topics
+
+```{r}
+userBrowserTopics %>% group_by(topic_name) %>% summarise(count=sum(count)) %>% arrange(-count)
+
+```
+
+
+
+```{r}
+
+userBrowserTopics %>% group_by(user_id, topic_name) %>% summarise(count=sum(count)) %>% group_by(topic_name) %>% summarise(users=length(unique(user_id))) %>% arrange(-users) 
+
+```
+
+
+
+# Interests Twitter
+
+
+
+```{r}
+
+languages <- c("english", "spanish", "french", "german", "portugese", "italian")
+
+allCategories = tibble(ID=character(), Category=character(), interest_name=character(), mainCategory=character())
+
+mainCategoriesEnglish <- NA 
+for(language in languages){
+  print(language)
+
+  twitterCategories <-  read_delim(paste("TwInterests/output-", language, ".csv", sep=""), delim=",",  escape_double = FALSE,escape_backslash = TRUE)
+  twitterCategories <- twitterCategories %>% rename(interest_name=Name)
+  mainCategories <- twitterCategories %>% group_by(Category) %>% summarise(ID=ID[1], interest_name=Category[1]) %>%
+    mutate(ID = paste0(substr(ID, 1, nchar(ID) - 3), "000"))
+  if(language == "english"){
+    mainCategoriesEnglish <- mainCategories %>% rename(mainCategory=ID, categoryName=interest_name)  %>% select(mainCategory, categoryName)
+    englishNames <- twitterCategories %>% rename(englishName=interest_name)
+  }
+  twitterCategories <- twitterCategories %>% union(mainCategories)
+  allCategories <- allCategories %>% union(twitterCategories %>%
+    mutate(mainCategory = paste0(substr(ID, 1, nchar(ID) - 3), "000"))) 
+}
+
+allCategories <- allCategories %>% left_join(mainCategoriesEnglish, by="mainCategory") %>% left_join(englishNames, by="ID")
+allCategories
+```
+
+```{r}
+classified_interests %>% filter(platform == "twitter") %>% left_join(allCategories, by="interest_name") %>% 
+  filter(!is.na(valoration)) %>% filter(!is.na(categoryName)) %>%
+  group_by(categoryName) %>% summarise(val = mean(valoration), n=n()) %>% arrange(-n)
+
+
+
+```
+
+
+
+```{r}
+classified_interests %>% filter(platform == "twitter") %>% left_join(allCategories, by="interest_name") %>% 
+  filter(!is.na(valoration)) %>% filter(!is.na(valoration)) %>% mutate(hasCategory = !is.na(categoryName))%>%
+  group_by(hasCategory) %>% summarise(val = mean(valoration), n=n()) %>% arrange(-n)
+
+
+
+```
+
+# Interests Linkedin
+
+# Facebook Interests
+
+```{r}
+fbAudiences <- read_delim("interestsFbAudiences.csv", delim=",", escape_double = FALSE,escape_backslash = TRUE)
+fbAudiences2 <- read_delim("interestsFbAudiences2.csv", delim=",", escape_double = FALSE,escape_backslash = TRUE)
+fbAudiences3 <- read_delim("interestsFbAudiences3.csv", delim=",", escape_double = FALSE,escape_backslash = TRUE)
+fbAudiences4 <- read_delim("interestsFbAudiences4.csv", delim=",", escape_double = FALSE,escape_backslash = TRUE)
+fbAudiences <- fbAudiences %>% union(fbAudiences2) %>% union(fbAudiences3) %>% union(fbAudiences4) %>% group_by(interest_name) %>% summarise(interest_name, audience_size)
+```
+
+
+```{r}
+
+breakpoints <- c( 1000, 10000, 100000, seq(1000000, 10000000, 500000), seq(10500000, 20000000, 500000), 30000000, seq(40000000, 400000000, 10000000))
+breakpoints <- c(10e3, 10e4, 10e5, 10e6, 10e7, 5*10e7, 10e8, 10e9, 10e10, 10e11)
+
+classified_interests %>% filter(platform == "facebook") %>% left_join(fbAudiences, by="interest_name") %>% mutate(amount_range =   cut(audience_size, breaks = breakpoints, include.lowest = TRUE)
+) %>% group_by(amount_range) %>% summarise(val = mean(valoration), n=n()) %>% filter(n > 1) %>% filter(!is.na(amount_range)) %>% ggplot() +
+  geom_bar(aes(x=amount_range, weight=val, fill=n)) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + theme_bw()
+
+```
+
+
+```{r boxPlotScoreAudices}
+
+breakpoints <- c(10e3, 10e4, 10e5, 10e6, 10e7, 10e8, 10e9, 10e10, 10e11, 10e12)
+
+classified_interests %>% filter(platform == "facebook") %>% left_join(fbAudiences, by="interest_name") %>% mutate(amount_range =   cut(audience_size, breaks = breakpoints, include.lowest = TRUE) 
+) %>% filter(!is.na(amount_range)) %>% ggplot(aes(x=amount_range, y=valoration)) +
+  geom_boxplot() + theme_bw() + labs(x="Audience Size", y="Score [1-5]") + stat_summary(geom = "errorbar", fun.min = mean, fun = mean, fun.max = mean, width = .75, linetype="dashed")
+
+```
+
+
+
+```{r boxPlotScoreAudices2}
+
+breakpoints <- c(10e3, 10e4, 10e5, 10e6, 5*10e6, 10e7, 5*10e7, 10e8, 5*10e8, 10e9, 5*10e9, 10e10, 5*10e10)
+
+classified_interests %>% filter(platform == "facebook") %>% left_join(fbAudiences, by="interest_name") %>% mutate(amount_range =   cut(audience_size, breaks = breakpoints, include.lowest = TRUE) 
+) %>% filter(!is.na(amount_range)) %>% ggplot(aes(x=amount_range, y=valoration)) +
+  geom_boxplot() + theme_bw() + labs(x="Audience Size", y="Score [1-5]") + stat_summary(geom = "errorbar", fun.min = mean, fun = mean, fun.max = mean, width = .75, linetype="dashed") + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+
+
+
+```{r}
+classified_interests %>% filter(platform == "facebook") %>% left_join(fbAudiences, by="interest_name") %>% filter(!is.na(audience_size)) %>% ggplot(aes(x=audience_size)) + geom_density(fill="#69b3a2", color="#e9ecef", alpha=0.8) + 
+  theme_minimal()
+```
+
+
+```{r fbAudiences}
+int_audience_fb <- classified_interests %>%
+  filter(platform == "facebook") %>%
+  left_join(fbAudiences, by = "interest_name") %>%
+  filter(!is.na(audience_size))
+
+print(int_audience_fb %>% ggplot(aes(x=(audience_size))) + geom_density(fill="#69b3a2", color="#e9ecef", alpha=0.8) + theme_bw())
+print(int_audience_fb %>% ggplot(aes(x=(audience_size))) + geom_density(fill="#69b3a2", color="#e9ecef", alpha=0.8) + theme_bw() + scale_x_log10() + labs(x= "Audience Size", y="Density"))
+print(
+fbAudiences %>% ggplot(aes(x=audience_size)) + geom_density(fill="#69b3a2", color="#e9ecef", alpha=0.8) + theme_bw()
+  
+)
+```
+
+
+```{r}
+
+ewma_vectorized_v2 <- function(x, a) {
+  s1 <- x[1]
+  sk <- s1
+  s <- vapply(x[-1], function(x) sk <<- (1 - a) * x + a * sk, 0)
+  s <- c(s1, s)
+  return(s)
+}
+
+moving_average <- function(x, elems) {
+  n <- length(x)
+  if (n <= elems) {
+    stop(paste("Input vector should have more than", elems, "elements"))
+  }
+  averages <- numeric(n)
+  for (i in (elems+1):n) {
+    averages[i] <- mean(x[(i - (elems - 1)):i])
+  }
+  return(averages[1:n])
+}
+```
+
+
+```{r fbAudiencesBars}
+
+
+n = 50
+
+  int_audience_fb %>% mutate(amount_range = cut(log10(audience_size), 
+                            breaks = seq(min(log10(audience_size)), max(log10(audience_size)), length.out = n), 
+                            include.lowest = F,
+                            labels = round(10^seq(min(log10(audience_size)), max(log10(audience_size)), length.out = n))[-n])) %>% # The -n is to remove the last index 
+  group_by(amount_range) %>%
+  summarise(val = mean(valoration), n = n()) %>%
+  filter(n >= 40, !is.na(amount_range)) %>%
+  ggplot() +
+  geom_bar(aes(x = amount_range, weight = val, fill = n)) +
+  geom_text(aes(x = amount_range, y = val, label = n), vjust = 0.3, size = 3, angle=90, hjust=-0.2) +  # Add text labels for sample count
+  theme_bw() +theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))  + ylim(0,4.3)
+
+```
+
+
+```{r fbAudiencesBars2}
+
+
+n = 40
+
+  int_audience_fb %>% mutate(amount_range = cut(log10(audience_size), 
+                            breaks = seq(min(log10(audience_size)), max(log10(audience_size)), length.out = n), 
+                            include.lowest = F)) %>% # The -n is to remove the last index 
+  group_by(amount_range) %>%
+  summarise(val = mean(valoration), n = n()) %>%
+  filter(n >= 40, !is.na(amount_range)) %>%
+  ggplot() +
+  geom_bar(aes(x = amount_range, weight = val, fill = n)) +
+  geom_text(aes(x = amount_range, y = val, label = n), vjust = 0.3, size = 3, angle=90, hjust=-0.2) +  # Add text labels for sample count
+  theme_bw() +theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))  + ylim(0,4.3)
+```
+
+
+
+```{r}
+library(ggpmisc)
+library(scales)
+```
+
+```{r}
+
+printEWMAwithR2 <- function(interests_to_analyze, alpha=0.999, n_to_filter=100){
+ interests_ewma <- interests_to_analyze %>% group_by(platform) %>% arrange(audience_size) %>% mutate(n=1) %>% mutate(n=cumsum(n)) %>% mutate_cond(n <= n_to_filter, valoration=mean(valoration)) %>% mutate(mean = ewma_vectorized_v2(valoration, alpha)) %>% filter(n >= n_to_filter)
+  
+  
+  summary <- summary(lm(mean ~ log10(audience_size), interests_ewma))
+  
+  print(summary)
+  
+  interests_ewma %>% ggplot(aes(x=(audience_size), y=mean)) +
+    geom_line() +
+    labs(title=paste("R2 =", round(summary$r.squared, 3), "α =", alpha, "Initial n =", n_to_filter)) +
+    stat_poly_line() +
+    stat_poly_eq(use_label(c("eq", "R2"))) +
+    scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x)) +
+    #annotation_logticks(sides = "b") +
+    theme_minimal() 
+    
+}
+
+printEWMAGroup <- function(interests_to_analyze, alpha=0.999, n_to_filter=100){
+  interests_ewma <- interests_to_analyze %>% group_by(platform) %>% arrange(audience_size) %>% mutate(n=1) %>% mutate(n=cumsum(n)) %>% mutate_cond(n <= n_to_filter, valoration=mean(valoration)) %>% mutate(mean = ewma_vectorized_v2(valoration, alpha)) %>% filter(n >= n_to_filter)
+  
+  
+  interests_ewma %>% ggplot() + geom_line(aes(x=(audience_size), y=mean, color=platform)) + labs(title=paste("α =", alpha, "Initial n =", n_to_filter)) + scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x)) + annotation_logticks(sides = "b") + theme_minimal() + theme(legend.position = "top")
+}
+
+
+printMAwithR2 <- function(interests_to_analyze, n_to_filter=100){
+    interests_ewma <- interests_to_analyze %>% group_by(platform) %>% arrange(audience_size) %>% mutate(n=1) %>% mutate(n=cumsum(n)) %>% mutate_cond(n <= n_to_filter, valoration=mean(valoration)) %>% mutate(mean = moving_average(valoration, n_to_filter)) %>% filter(n > n_to_filter)
+  
+  
+  summary <- summary(lm(mean ~ log10(audience_size), interests_ewma))
+  
+  print(summary)
+  
+  interests_ewma %>% ggplot(aes(x=(audience_size), y=mean)) +
+    geom_line() +
+    stat_poly_line() +
+    stat_poly_eq(use_label(c("eq", "R2"))) +
+    scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x)) +
+    #annotation_logticks(sides = "b") +
+    theme_minimal() 
+    
+}
+
+printEWMAGroup <- function(interests_to_analyze, alpha=0.999, n_to_filter=100){
+  interests_ewma <- interests_to_analyze %>% group_by(platform) %>% arrange(audience_size) %>% mutate(n=1) %>% mutate(n=cumsum(n)) %>% mutate_cond(n <= n_to_filter, valoration=mean(valoration)) %>% mutate(mean = ewma_vectorized_v2(valoration, alpha)) %>% filter(n >= n_to_filter)
+  
+  
+  interests_ewma %>% ggplot() + geom_line(aes(x=(audience_size), y=mean, color=platform)) + labs(title=paste("α =", alpha, "Initial n =", n_to_filter)) + scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x)) + annotation_logticks(sides = "b") + theme_minimal() + theme(legend.position = "top")
+}
+
+```
+
+
+
+
+
+```{r fbAudiencesEWMA}
+printEWMAwithR2(int_audience_fb, 0.99, 1000)
+printEWMAwithR2(int_audience_fb, 0.999, 1000)
+printEWMAwithR2(int_audience_fb, 0.99, 100)
+printEWMAwithR2(int_audience_fb, 0.999, 100)
+```
+
+
+
+```{r}
+twAudiences <- read_delim("interestsTwAudiences.csv", delim=",", escape_double = FALSE,escape_backslash = TRUE) %>% filter(audience_size > 0)
+twAudiences2 <- read_delim("interestsTwAudiences2.csv", delim=",", escape_double = FALSE,escape_backslash = TRUE) %>% select(interest_name, audience_size) %>% mutate(interest_name=tolower(interest_name))
+twAudiences <- twAudiences %>% union(twAudiences2) %>% group_by(interest_name) %>% summarise(audience_size=max(audience_size))
+```
+
+```{r twAudiencesBars}
+
+int_audience_tw <- classified_interests %>%
+         filter(platform == "twitter") %>%  mutate(interest_name=tolower(interest_name)) %>% left_join(allCategories %>% mutate(interest_name=tolower(interest_name)) %>% select(ID, interest_name, englishName), by="interest_name") %>% mutate_cond(!is.na(ID), interest_name=tolower(englishName)) %>% 
+  left_join(twAudiences, by = "interest_name") %>% arrange(audience_size) %>%
+  filter(!is.na(audience_size))
+
+n = 50
+
+  int_audience_tw %>% mutate(amount_range = cut(log10(audience_size), 
+                            breaks = seq(min(log10(audience_size)), max(log10(audience_size)), length.out = n), 
+                            include.lowest = F,
+                            labels = round(10^seq(min(log10(audience_size)), max(log10(audience_size)), length.out = n))[-n])) %>% # The -n is to remove the last index 
+  group_by(amount_range) %>%
+  summarise(val = mean(valoration), n = n()) %>%
+  filter(n >= 1, !is.na(amount_range)) %>%
+  ggplot() +
+  geom_bar(aes(x = amount_range, weight = val, fill = n)) +
+  geom_text(aes(x = amount_range, y = val, label = n), vjust = 0.3, size = 3, angle=90, hjust=-0.2) +  # Add text labels for sample count
+  theme_bw() +theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))  + ylim(0,4.3)
+
+```
+
+```{r twAudiences}
+printEWMAwithR2(int_audience_tw, 0.99, 1000)
+printEWMAwithR2(int_audience_tw, 0.999, 1000)
+printEWMAwithR2(int_audience_tw, 0.99, 100)
+printEWMAwithR2(int_audience_tw, 0.999, 100)
+```
+
+
+
+```{r}
+liAudiences <- read_delim("LinkedInAudiences.csv", delim=",", escape_double = FALSE,escape_backslash = TRUE)
+```
+
+```{r liAudiencesBars}
+
+int_audience_li <- classified_interests %>%
+  filter(platform == "linkedin") %>%
+  left_join(liAudiences, by = "interest_id") %>% arrange(audience_size) %>%
+  filter(!is.na(audience_size))
+
+n = 50
+
+int_audience_li %>% mutate(amount_range = cut(log10(audience_size), 
+                            breaks = seq(min(log10(audience_size)), max(log10(audience_size)), length.out = n), 
+                            include.lowest = F,
+                            labels = round(10^seq(min(log10(audience_size)), max(log10(audience_size)), length.out = n))[-n])) %>% # The -n is to remove the last index 
+  group_by(amount_range) %>%
+  summarise(val = mean(valoration), n = n()) %>%
+  filter(n >= 1, !is.na(amount_range)) %>%
+  ggplot() +
+  geom_bar(aes(x = amount_range, weight = val, fill = n)) +
+  geom_text(aes(x = amount_range, y = val, label = n), vjust = 0.3, size = 3, angle=90, hjust=-0.2) +  # Add text labels for sample count
+  theme_bw() +theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))  + ylim(0,4.3)
+
+```
+```{r liAudiences}
+printEWMAwithR2(int_audience_li, 0.99, 1000)
+printEWMAwithR2(int_audience_li, 0.999, 1000)
+printEWMAwithR2(int_audience_li, 0.99, 100)
+printEWMAwithR2(int_audience_li, 0.999, 100)
+```
+
+
+```{r allAudiences}
+all_audiences <- int_audience_li %>% union(int_audience_tw %>% select(!ID) %>% select(!englishName)) %>% union(int_audience_fb)
+
+
+all_audiences %>% ggplot(aes(x=audience_size, fill=platform)) + geom_density(alpha=0.7) + theme_bw() + theme(legend.position="bottom")
+
+all_audiences %>% ggplot(aes(x=(audience_size), fill=platform)) + geom_density(alpha=0.7, adjust=1) + theme_bw() +  theme(legend.position="bottom") + scale_x_log10() + labs(x="Audience size", y="Density", fill="Platforms") 
+```
+
+```{r allAudiencesAllInterests}
+
+int_audience_tw_all <- interests_filtered %>%
+   filter(platform == "twitter") %>%  mutate(interest_name=tolower(interest_name)) %>% left_join(allCategories %>% mutate(interest_name=tolower(interest_name)) %>% select(ID, interest_name, englishName), by="interest_name") %>% mutate_cond(!is.na(ID), interest_name=tolower(englishName)) %>% 
+  left_join(twAudiences, by = "interest_name") %>% arrange(audience_size) %>%
+  filter(!is.na(audience_size))
+  
+int_audience_li_all <- interests_filtered %>%
+  filter(platform == "linkedin") %>%
+  left_join(liAudiences, by = "interest_id") %>% arrange(audience_size) %>%
+  filter(!is.na(audience_size))
+  
+int_audience_fb_all <- interests_filtered %>%
+  filter(platform == "facebook") %>%
+  left_join(fbAudiences, by = "interest_name") %>%
+  filter(!is.na(audience_size))
+
+all_audiences_all <- int_audience_li_all %>% union(int_audience_tw_all %>% select(!ID) %>% select(!englishName)) %>% union(int_audience_fb_all)
+
+
+all_audiences_all %>% ggplot(aes(x=(audience_size), fill=platform)) + geom_density(alpha=0.7, adjust=1) + theme_bw() +  theme(legend.position="bottom") + scale_x_log10() + labs(x="Audience size", y="Density", fill="Platforms") 
+
+```
+
+```{r}
+all_audiences %>% ggplot(aes(x=(audience_size), color=platform)) + theme_bw() + stat_ecdf(geom = "point") +  theme(legend.position="bottom") + scale_x_log10() + labs(x="Audience size", y="Density", fill="Platforms") 
+
+```
+
+
+
+```{r audiencesSizesScalingByUsers}
+MAU <- tibble(platform=c("facebook", "twitter", "linkedin"), MAU=c(2989000000, 353900000, 850000000))
+
+all_audiences_mau <- all_audiences %>% left_join(MAU, by="platform") %>% mutate(audience_size = audience_size/MAU)
+printEWMAGroup(all_audiences_mau, 0.999, 100)
+
+all_audiences_mau %>% ggplot(aes(x=log10(audience_size), fill=platform)) + geom_density(alpha=0.8) + theme_bw() + theme(legend.position="bottom")
+```
+
+
+
+```{r}
+ads_with_reasons_tab %>% filter(platform != "google") %>% mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% group_by(interest_name, platform) %>% slice(1), by="interest_name") %>% filter(!is.na(audience_size)) %>% ggplot() + geom_density(aes(x=audience_size, fill=platform.x), alpha=0.8, adjust=0.2) + scale_x_log10()
+
+```
+```{r AudienceSizeAssignedInterestsVsUsedInterestsToTarget}
+ads_with_reasons_tab %>% mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% mutate(interest_name = tolower(interest_name)) %>% group_by(interest_name, platform) %>% slice(1), by=c("interest_name", "platform")) %>% filter(!is.na(audience_size)) %>% select(platform, audience_size) %>% mutate(type="Interests used in Ads") %>% bind_rows(
+  all_audiences %>% select(platform, audience_size) %>% mutate(type="Assigned interests")
+)  %>% ggplot() + 
+  geom_density(aes(x=audience_size, group=type, fill=type), alpha=0.8, adjust=1) + facet_wrap(~platform, scale="free") +
+  scale_x_log10() + theme_bw() + theme(legend.position = "bottom") + labs(x="Audience Size", y ="Density", fill="") 
+
+
+
+```
+
+```{r AudienceSizeAssignedInterestsVsUsedInterestsToTargetTwitterWithoutKeywords}
+
+tw_info <- ads_with_reasons_tab %>% mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% mutate(interest_name = tolower(interest_name)) %>% filter(platform=="twitter") %>% group_by(interest_name, platform) %>% slice(1), by=c("interest_name", "platform")) %>% filter(!is.na(audience_size)) %>% select(platform, audience_size) %>% mutate(type="Interests used in Ads") %>% bind_rows(
+  int_audience_tw %>% mutate(isInterest = !is.na(ID)) %>% mutate(type="Keyword") %>%
+  mutate_cond(isInterest, type="Assigned interests") %>% filter(type=="Assigned interests")
+) %>% select(platform, audience_size, type) 
+
+
+ads_with_reasons_tab %>% group_by(ad_id) %>% ungroup%>% mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% mutate(interest_name = tolower(interest_name)) %>% group_by(interest_name, platform) %>% slice(1), by=c("interest_name", "platform")) %>% filter(!is.na(audience_size)) %>% select(platform, audience_size) %>% mutate(type="Interests used in Ads") %>% bind_rows(
+  all_audiences %>% select(platform, audience_size) %>% mutate(type="Assigned interests")
+)  %>% filter(platform!="twitter") %>% bind_rows(tw_info) %>% ggplot() + 
+  geom_density(aes(x=audience_size, group=type, fill=type), alpha=0.8, adjust=1) + facet_wrap(~platform, scale="free") +
+  scale_x_log10() + theme_bw() + theme(legend.position = "bottom") + labs(x="Audience Size", y ="Density", fill="") 
+
+
+
+```
+
+
+
+```{r}
+ 
+tw_info <- ads_with_reasons_tab  %>% mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% mutate(interest_name = tolower(interest_name)) %>% filter(platform=="twitter") %>% group_by(interest_name, platform) %>% slice(1), by=c("interest_name", "platform")) %>% filter(!is.na(audience_size)) %>% select(platform, audience_size) %>% mutate(type="Interests used in Ads") %>% bind_rows(
+  int_audience_tw %>% mutate(isInterest = !is.na(ID)) %>% mutate(type="Keyword") %>%
+  mutate_cond(isInterest, type="Assigned interests") %>% filter(type=="Assigned interests")
+) %>% select(platform, audience_size, type) 
+
+
+interests_ads_audiences_tib <- ads_with_reasons_tab %>%  mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% mutate(interest_name = tolower(interest_name)) %>% group_by(interest_name, platform) %>% slice(1), by=c("interest_name", "platform")) %>% filter(!is.na(audience_size)) %>% select(platform, audience_size) %>% mutate(type="Interests used in Ads") %>% bind_rows(
+  all_audiences %>% select(platform, audience_size) %>% mutate(type="Assigned interests")
+)  %>% filter(platform!="twitter") %>% bind_rows(tw_info)
+
+interests_ads_audiences_tib  %>% group_by(platform, type) %>% 
+  summarise(q50=median(audience_size),
+            q05=quantile(audience_size, .05),
+            q10=quantile(audience_size, .1),
+  )
+
+```
+
+
+```{r AudienceSizeAssignedInterestsVsUsedInterestsToTargetWithClicks}
+ads_with_reasons_tab %>% mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% mutate(interest_name = tolower(interest_name)) %>% group_by(interest_name, platform) %>% slice(1), by=c("interest_name", "platform")) %>% filter(!is.na(audience_size)) %>% select(platform, audience_size) %>% mutate(type="Interests used in Ads") %>% bind_rows(
+  all_audiences %>% select(platform, audience_size) %>% mutate(type="Assigned interests")
+) %>% bind_rows(
+ads_with_reasons_tab %>% mutate(interest_name=tolower(interest_name)) %>% inner_join(landingPagesVisited, by=c("user_id", "ad_id")) %>% inner_join(all_audiences %>% mutate(interest_name=tolower(interest_name)) %>% group_by(interest_name, audience_size, platform) %>% slice(1), by=c("interest_name", "platform")) %>% select(platform, audience_size) %>% mutate(type="Clicked Ad Interests")
+) %>% ggplot() + 
+  geom_density(aes(x=audience_size, group=type, fill=type), alpha=0.8, adjust=1) + facet_wrap(~platform, scale="free") +
+  scale_x_log10() + theme_bw() + theme(legend.position = "bottom") + labs(x="Audience Size", y ="Density", fill="") 
+
+```
+
+
+
+
+```{r twitterInsterestsKeywordsDistribution}
+
+int_audience_tw_all %>% mutate(isInterest = !is.na(ID)) %>% mutate(type="Keyword") %>%
+  mutate_cond(isInterest, type="Interest") %>% 
+  ggplot(aes(x=audience_size, fill=type)) +geom_density(alpha=0.8) + scale_x_log10() + theme_bw() +
+  theme(legend.position = "bottom") + labs(x="Audience size", y="Density", fill="")
+
+
+```
+
+```{r twitterInsterestsAndTarget}
+
+
+
+
+ads_with_reasons_tab %>% mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% mutate(interest_name = tolower(interest_name)) %>% filter(platform=="twitter") %>% group_by(interest_name, platform) %>% slice(1), by=c("interest_name", "platform")) %>% filter(!is.na(audience_size)) %>% select(platform, audience_size) %>% mutate(type="Interests used in Ads") %>% bind_rows(
+  int_audience_tw %>% mutate(isInterest = !is.na(ID)) %>% mutate(type="Keyword") %>%
+  mutate_cond(isInterest, type="Interest")  %>% filter(type=="Interest")
+) %>% ggplot() + 
+  geom_density(aes(x=audience_size, group=type, fill=type), alpha=0.8, adjust=1) + facet_wrap(~platform, scale="free_y") +
+  scale_x_log10() + theme_bw() + theme(legend.position = "bottom") + labs(x="Audience Size", y ="Density", fill="") 
+
+```
+
+
+
+```{r twitterInsterestsAndTargetClicks}
+
+
+
+
+ads_with_reasons_tab %>% mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% mutate(interest_name = tolower(interest_name)) %>% group_by(interest_name, platform) %>% slice(1), by=c("interest_name", "platform")) %>% filter(!is.na(audience_size)) %>% select(platform, audience_size) %>% mutate(type="Interests used in Ads") %>% bind_rows(
+  int_audience_tw %>% mutate(isInterest = !is.na(ID)) %>% mutate(type="Keyword") %>%
+  mutate_cond(isInterest, type="Interest")  %>% filter(type=="Interest")
+) %>% bind_rows(
+ads_with_reasons_tab %>% mutate(interest_name=tolower(interest_name)) %>% inner_join(landingPagesVisited, by=c("user_id", "ad_id")) %>% inner_join(all_audiences %>% mutate(interest_name=tolower(interest_name)) %>% group_by(interest_name, audience_size, platform) %>% slice(1), by=c("interest_name", "platform")) %>% select(platform, audience_size) %>% mutate(type="Clicked Ad Interests")
+) %>% ggplot() + 
+  geom_density(aes(x=audience_size, group=type, fill=type), alpha=0.8, adjust=1) + facet_wrap(~platform, scale="free_y") +
+  scale_x_log10() + theme_bw() + theme(legend.position = "bottom") + labs(x="Audience Size", y ="Density", fill="") 
+
+```
+
+
+
+```{r}
+all_audiences %>% mutate(type="Assigned interests") %>% select(platform, audience_size, type) %>% bind_rows(tibble(platform="facebook", audience_size=1000000, type="dfjk")) %>%
+ggplot() + 
+  geom_density(aes(x=audience_size, group=type, fill=type), alpha=0.8, adjust=0.2) + facet_wrap(~platform, scale="free") +
+  scale_x_log10() + theme(legend.position = "bottom") + labs(x="Audience Size", y ="Density", fill="Type")
+
+
+``` 
+
+
+
+
+I do not know what exactly this means but this may be something relevant
+```{r}
+
+ads_with_reasons_tab %>% mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% mutate(interest_name = tolower(interest_name)) %>% group_by(interest_name, platform) %>% slice(1), by=c("interest_name", "platform")) %>% filter(!is.na(audience_size)) %>% filter(!is.na(valoration.x)) %>% ggplot() + geom_boxplot(aes(x=valoration.x, y=audience_size, group=valoration.x)) + scale_y_log10() + facet_wrap(~platform, scales = )
+
+```
+
+#Ad targeting efficiency in Ad Platforms
+
+```{r}
+
+ads_with_reasons_tab %>% group_by(user_id, platform) %>% filter(n() >= 25) %>% count(interest_name, platform, ad_valoration_by_interests, user_id) %>% group_by(user_id, platform) %>% mutate(rate = n/sum(n)) %>% group_by(user_id,platform,ad_valoration_by_interests) %>% summarise(rate=sum(rate)) %>%  ggplot() + geom_boxplot(aes(x=ad_valoration_by_interests, y=rate, group=ad_valoration_by_interests))
+
+```
+
+
+```{r}
+min_n = 15
+# Select users with greater than min_n(20) ads with reasons 
+users_with_ads <- unique((ads_with_reasons_tab %>% group_by(user_id, platform) %>% filter(n() >= min_n))$user_id)
+
+relevant_interests <- ads_with_reasons_tab %>% group_by(user_id, platform) %>% filter(n() >= min_n) %>% ungroup %>% count(user_id, interest_name, platform) %>% ungroup %>% group_by(interest_name, platform) %>% filter(n()>=2)
+
+new_interest_list <- interests_filtered  %>% filter(user_id %in% users_with_ads) %>%
+  inner_join(relevant_interests %>% count(interest_name, platform), by=c("interest_name", "platform")) %>%
+  rename(peopleWithSaidInterst = n) %>% group_by(user_id, interest_name, platform) %>% slice(1)
+
+interests_with_ads_ap <- new_interest_list %>% left_join(relevant_interests, by=c("user_id",  "interest_name", "platform"))
+
+interests_with_users_rate <- interests_with_ads_ap %>% group_by(user_id, platform) %>% mutate_cond(is.na(n), n=0) %>% mutate(userRate = n / sum(n, na.rm=T)) %>% ungroup
+
+interests_with_priority <- interests_with_users_rate %>% filter(!is.na(userRate)) %>% group_by(interest_name, platform) %>% mutate(adRate = sum(userRate)) %>% ungroup %>% mutate(priority = userRate/adRate) %>% filter(priority < 1)
+
+interests_with_priority %>% ggplot() + geom_boxplot(aes(x= valoration, y=priority, group=valoration))
+``` 
+
+```{r}
+
+ads_with_reasons_tab %>% mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% mutate(interest_name = tolower(interest_name)) %>% group_by(interest_name, platform) %>% slice(1), by=c("interest_name", "platform")) %>% filter(!is.na(audience_size)) %>% select(platform, audience_size) %>% mutate(type="Interests used in Ads") %>% bind_rows(
+    all_audiences %>% select(platform, audience_size) %>% mutate(type="Assigned interests")
+) %>% group_by(platform, type) %>% summarise(median(audience_size), min(audience_size), quantile(audience_size, .05), sum(audience_size < 1000000)/n())
+
+
+```
+
+
+```{r}
+
+ads_with_reasons_tab %>% filter(platform != "google") %>% mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% select(!valoration) %>% group_by(interest_name, platform) %>% slice(1), by="interest_name") %>% filter(!is.na(audience_size)) %>% rename(userValuation=valoration) %>% rename(adValuationByInterestReason=ad_valoration_by_interests)  %>% group_by(adValuationByInterestReason) %>% summarise(mean(userValuation, na.rm=T), n(), median(audience_size))
+
+ads_with_reasons_tab %>% filter(platform != "google") %>% mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% mutate(interest_name=tolower(interest_name)) %>% select(!valoration) %>% group_by(interest_name, platform) %>% slice(1), by=c("interest_name", "platform")) %>% filter(!is.na(audience_size)) %>% filter(!is.na(valoration)) %>% rename(userValuation=valoration) %>% rename(adValuationByInterestReason=ad_valoration_by_interests) %>%
+  filter(audience_size < 1000000) %>% group_by(userValuation) %>% summarise(mean(adValuationByInterestReason), n(), sum(audience_size > 1000000), median(audience_size))
+
+ads_with_reasons_tab %>% filter(!is.na(valoration)) %>% rename(userValuation=valoration) %>% rename(adValuationByInterestReason=ad_valoration_by_interests)  %>% group_by(adValuationByInterestReason) %>% summarise(mean(userValuation), n())
+ads_with_reasons_tab %>% filter(!is.na(valoration)) %>% rename(userValuation=valoration) %>% rename(adValuationByInterestReason=ad_valoration_by_interests) %>% group_by(userValuation) %>% summarise(mean(adValuationByInterestReason), n())
+```
+
+
+```{r}
+all_audiences %>% filter(audience_size < 10^5) %>% group_by(platform)  %>% summarise(mean(valoration)) 
+all_audiences %>% filter(audience_size > 10^5) %>% group_by(platform)  %>% summarise(mean(valoration))
+all_audiences %>% filter(audience_size < 10^6) %>% group_by(platform)  %>% summarise(mean(valoration)) 
+all_audiences %>% filter(audience_size > 10^6) %>% group_by(platform)  %>% summarise(mean(valoration)) 
+all_audiences %>% filter(audience_size > 10^7) %>% group_by(platform)  %>% summarise(mean(valoration)) 
+all_audiences %>% filter(audience_size < 10^7) %>% group_by(platform)  %>% summarise(mean(valoration)) 
+
+all_audiences %>% filter(audience_size > 10^8) %>% group_by(platform)  %>% summarise(mean(valoration)) 
+all_audiences %>% filter(audience_size > 10^9) %>% group_by(platform)  %>% summarise(mean(valoration)) 
+
+```
+
+
+
+
+```{r}
+
+ads_with_reasons_tab %>% mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% mutate(interest_name = tolower(interest_name)) %>% group_by(interest_name, platform) %>% slice(1), by=c("interest_name", "platform")) %>% filter(!is.na(audience_size)) %>% ungroup %>% summarise(median(audience_size), quantile(audience_size))
+
+
+
+audiences_targeted <- (ads_with_reasons_tab %>% mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% mutate(interest_name = tolower(interest_name)) %>% group_by(interest_name, platform) %>% slice(1), by=c("interest_name", "platform")) %>% filter(!is.na(audience_size)) )$audience_size
+
+
+quantile(audiences_targeted, probs=c(.01, .02, .05, .1))
+
+```
+
+```{r densityAllTargetedInterests}
+ads_with_reasons_tab %>% mutate(interest_name=tolower(interest_name)) %>% left_join(all_audiences %>% mutate(interest_name = tolower(interest_name)) %>% group_by(interest_name, platform) %>% slice(1), by=c("interest_name", "platform")) %>% filter(!is.na(audience_size))  %>%  ggplot(aes(x=audience_size)) +geom_density(alpha=0.8) + scale_x_log10() + theme_bw() +
+  theme(legend.position = "bottom") + labs(x="Audience size", y="Density", fill="")
+```
+
+
+```{r barsScaledByMAU}
+
+
+n = 50
+
+  all_audiences_mau %>% mutate(amount_range = cut(log10(audience_size), 
+                            breaks = seq(min(log10(audience_size)), max(log10(audience_size)), length.out = n))) %>% 
+  group_by(amount_range) %>%
+  summarise(val = mean(valoration), n = n()) %>%
+  filter(n >= 1, !is.na(amount_range)) %>%
+  ggplot() +
+  geom_bar(aes(x = amount_range, weight = val, fill = n)) +
+  geom_text(aes(x = amount_range, y = val, label = n), vjust = 0.3, size = 3, angle=90, hjust=-0.2) +  # Add text labels for sample count
+  theme_bw() +theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))  + ylim(0,4.3)
+
+```
+
+```{r boxPlotValorationXAudiceY}
+all_audiences <- all_audiences %>% filter(valoration > 0)
+
+all_audiences %>% filter(valoration > 0) %>% ggplot(aes(x=valoration, y=(audience_size), fill=as.factor(valoration))) + geom_boxplot() + scale_y_continuous(trans='log10') + facet_wrap(~platform, scales="free") + theme_bw() + theme(legend.position = "none") +
+  labs(x="Score [1-5]", y="Audience Size")
+
+```
+
+```{r statisticalInterestRelevance}
+
+
+model_anova <- aov(valoration  ~ platform * audience_size, data = all_audiences)
+summary(model_anova)
+
+```
+
+
+```{r statisticalInterestRelevance2}
+
+
+model_anova <- aov(audience_size  ~ platform * valoration, data = (all_audiences %>% mutate(valoration = as.factor(valoration), platform=as.factor(platform))))
+summary(model_anova)
+
+```
+```{r}
+library(multcomp)
+library(car)
+Anova(model_anova, type="III")
+```
+
+
+```{r}
+tukey_result <- glht(model_anova, linfct = mcp(valoration = "Tukey"))
+summary(tukey_result)
+
+```
+
+```{r boxPlotValorationXAudiceYTw}
+
+all_audiences  %>% mutate(interest_name=tolower(interest_name)) %>% left_join(allCategories %>% mutate(interest_name=tolower(interest_name)) %>% group_by(interest_name) %>% slice(1)) %>% mutate_cond(platform=="twitter" & is.na(categoryName), platform="twitter keywords")  %>% ggplot(aes(x=valoration, y=(audience_size), fill=as.factor(valoration))) + geom_boxplot() + scale_y_continuous(trans='log10') + facet_wrap(~platform, scales="free", ncol=4) + theme_bw() + theme(legend.position = "none") +
+  labs(x="Score [1-5]", y="Audience Size")
+
+```
+
+# Quality metrics
+## Overprofiling
+```{r}
+classified_interests %>%  filter(platform!="garbage") %>% filter(platform!="google") %>%
+  mutate(one_star = valoration <= 1,
+         two_star = valoration <= 2,
+         three_star = valoration <= 3,
+         good_interest = valoration >= 4) %>%
+  group_by(platform) %>% 
+  summarise(one_star = sum(one_star)/n(), 
+            two_star = sum(two_star)/n(), 
+            three_star = sum(three_star)/n(),
+            good_interest = sum(good_interest)/n()            
+            )
+```
+
+
+```{r}
+classified_interests %>% filter(platform!="garbage") %>% filter(platform!="google") %>% group_by(user_id, platform) %>% summarise(valoration = mean(valoration))  %>% 
+  mutate(one_star = valoration <= 1,
+         two_star = valoration <= 2,
+         three_star = valoration <= 3,
+         good_profile = valoration > 3) %>%
+  group_by(platform) %>% 
+  summarise(one_star = sum(one_star)/n(), 
+            two_star = sum(two_star)/n(), 
+            three_star = sum(three_star)/n(),
+            good_profile = sum(good_profile)/n()            
+            )
+```
+
+## 3 or more stars interests
+```{r}
+classified_interests %>% mutate(goodInterest = valoration >= 3) %>% group_by(platform, goodInterest) %>% 
+  summarise(interests=n()) %>% spread(goodInterest, interests) %>% group_by(platform) %>%
+  summarise(score = `TRUE` / (`TRUE` + `FALSE`))
+```
+
+## 3 or more stars by user 
+
+```{r}
+classified_interests %>% group_by(platform, user_id) %>% summarise(interests = n(), valoration = mean(valoration)) %>% 
+  filter(interests >= 10) %>% mutate(goodInterest = valoration >= 3) %>% group_by(platform, goodInterest) %>% 
+  summarise(interests=n()) %>% spread(goodInterest, interests) %>% group_by(platform) %>%
+  summarise(score = `TRUE` / (`TRUE` + `FALSE`))
+
+
+
+```
+
+```{r interestsValoration}
+
+classified_interests %>% filter(valoration >= 1) %>% filter(platform!="garbage") %>% filter(platform!="google") %>% group_by(user_id, platform) %>% summarise(valoration = mean(valoration)) %>% ggplot(aes(x=valoration, color=platform)) +  stat_ecdf(geom = "line") + theme_bw() + theme(legend.position="bottom")
+
+```
+
+```{r interestsValorationECDF}
+
+classified_interests %>% filter(valoration >= 1) %>% filter(platform!="garbage") %>% filter(platform!="google") %>% group_by(user_id, platform) %>% filter(n() > 5) %>% summarise(valoration = mean(valoration)) %>% ggplot(aes(x=valoration, color=platform)) +  stat_ecdf(geom = "line") + theme_bw() + theme(legend.position="bottom") + labs(y="ECDF", x="Mean Interest Valuation by User")
+
+```
+
+
+```{r adValorationECDF}
+
+ad_class %>% filter(valoration >= 1) %>% filter(platform!="garbage") %>% filter(platform!="youtube") %>% group_by(user_id, platform) %>% filter(n() > 1) %>% summarise(valoration = mean(valoration)) %>% ggplot(aes(x=valoration, color=platform)) +  stat_ecdf(geom = "line") + theme_bw() + theme(legend.position="bottom") + labs(y="ECDF", x="Mean Ad Valuation by User")
+
+```
+
+```{r}
+
+platform_score <- function(x){
+  result <- sapply(seq_along(x), function(i) {
+    (x[i] - mean(x[-i]))
+  })
+  result
+}
+
+classified_interests %>% group_by(platform, user_id) %>% summarise(interests = n(), valoration = mean(valoration)) %>% 
+  filter(interests >= 25) %>% filter(platform != "garbage") %>% group_by(user_id) %>% mutate(score = platform_score(valoration)) %>% group_by(platform) %>%
+  summarise(score = mean(score, na.rm=T))  
+
+
+
+```
+
+
+
+
+## 3 or more stars
+```{r}
+ad_class %>% mutate(goodAd = valoration >= 3) %>% group_by(platform, goodAd) %>% 
+  summarise(ads=n()) %>% spread(goodAd, ads) %>% group_by(platform) %>%
+  summarise(score = `TRUE` / (`TRUE` + `FALSE`))
+```
+
+
+
+
+# Repeated ads
+
+```{r}
+interests_analysis_amount <- interests_filtered %>% filter(platform != "garbage") %>% filter(platform!= "browser") %>% mutate_cond(platform=="googleTopic", platform="google") %>% group_by(user_id) %>% mutate(total_mean=mean(valoration, na.rm=T)) %>% group_by(platform, user_id, total_mean) %>% filter(sum(!is.na(valoration)) >= 10) %>% summarise(val = mean(valoration, na.rm = T), interests=n()) 
+``` 
+
+
+
+
+```{r}
+
+get_range <- function(amount){
+   if (amount >= 0 & amount <= 50) {
+    return("0-50")
+  } else if (amount > 50 & amount <= 100) {
+    return("50-100")
+  } else if (amount > 100 & amount <= 200) {
+    return("100-200")
+  } else if (amount > 200 & amount <= 300) {
+    return("200-300")
+  } else if (amount > 300 & amount <= 400) {
+    return("300-400")
+  } else if (amount > 400 & amount <= 500) {
+    return("400-500")
+  } else {
+    return("500+")
+  }
+}
+
+get_range <- function(amount){
+   if (amount >= 0 & amount <= 50) {
+    return("0-50")
+   } else if (amount > 50 & amount <= 100) {
+    return("50-100")
+  }else{
+    return("100+")
+  }
+}
+
+get_valuation_range <- function(amount) {
+  if (amount >= 1 & amount < 1.5) {
+    return("1-1.5")
+  } else if (amount >= 1.5 & amount < 2) {
+    return("1.5-2")
+  } else if (amount >= 2 & amount < 2.5) {
+    return("2-2.5")
+  } else if (amount >= 2.5 & amount < 3) {
+    return("2.5-3")
+  } else if (amount >= 3 & amount < 3.5) {
+    return("3-3.5")
+  } else if (amount >= 3.5 & amount < 4) {
+    return("3.5-4")
+  } else if (amount >= 4 & amount < 4.5) {
+    return("4-4.5")
+  } else if (amount >= 4.5) {
+    return("4.5-5")
+  } else {
+    return("Invalid amount")
+  }
+}
+
+
+get_valuation_range <- function(amount) {
+  if (amount >= 1 & amount < 2) {
+    return("1-2")
+  } else if (amount >= 2 & amount < 3) {
+    return("2-3")
+  } else if (amount >= 3 & amount < 4) {
+    return("3-4")
+  } else if (amount >= 4 & amount < 5) {
+    return("4-5")
+  } else if (amount >= 5) {
+    return("5+")
+  } else {
+    return("Invalid amount")
+  }
+}
+
+
+heatmap_interests_data <- interests_analysis_amount %>% mutate(range = get_range(interests), valuation=get_valuation_range(val)) %>% group_by(platform, range)  %>% group_by(platform, range, valuation) %>% summarise(n=n()) %>% mutate(share=n/sum(n)*100)
+```
+
+
+
+
+```{r}
+process_groups_perc_2 <- function(groups, interest_tibble) {
+  interest_tibble <- interest_tibble %>% group_by(platform) 
+
+  final_tibble <- interest_tibble %>% slice(0) %>% mutate(range="")
+  for(group in groups){
+    new_interest_tibble <- interest_tibble
+    if(!is.na(group[1])){
+      new_interest_tibble <- new_interest_tibble %>% filter(interests > as.numeric(group[1]))
+    }
+    if(!is.na(group[2])){
+      new_interest_tibble <- new_interest_tibble %>% filter(interests <= as.numeric(group[2]))
+    }
+    new_interest_tibble <- new_interest_tibble %>% mutate(range=group[3])
+    final_tibble <- final_tibble %>% union(new_interest_tibble)
+  }
+  final_tibble <- final_tibble %>% group_by(platform, user_id, range) %>% mutate(valuation=get_valuation_range(val)) 
+  
+  final_tibble
+}
+
+
+groups_ranges_labels <- list(
+  c(0, 50, "50-"),
+  c(50, 100, "50-100"),
+  c(100, 250, "100-250"),
+  c(250, 500, "250-500"),
+  c(500, NA, "500+")
+)
+
+
+groups_ranges_labels <- list(
+  c(NA, 250, "-250"),
+  c(250, NA, "250+")
+)
+
+
+process_groups <- function(groups, interest_tibble) {
+  final_tibble <- interest_tibble %>% slice(0) %>% mutate(range="")
+  for(group in groups){
+    new_interest_tibble <- interest_tibble
+    if(!is.na(group[1])){
+      new_interest_tibble <- new_interest_tibble %>% filter(interests > as.numeric(group[1]))
+    }
+    if(!is.na(group[2])){
+      new_interest_tibble <- new_interest_tibble %>% filter(interests <= as.numeric(group[2]))
+    }
+    new_interest_tibble <- new_interest_tibble %>% mutate(range=group[3])
+    final_tibble <- final_tibble %>% union(new_interest_tibble)
+  }
+  final_tibble <- final_tibble %>% group_by(platform, user_id, range) %>% mutate(valuation=get_valuation_range(val)) 
+  print(final_tibble)
+  
+  final_tibble <- final_tibble %>% group_by(platform, range, valuation) %>% summarise(n=n()) %>% mutate(share=n/sum(n)*100) %>% ungroup
+  final_tibble
+}
+
+get_ranges_array <- function(groups){
+  ranges_array <- c()
+  i <- 1
+  for(group in groups){
+    ranges_array[i] <- group[3]
+    i <- i + 1
+  }
+  ranges_array
+}
+
+
+groups_ranges_labels <- list(
+  c(0, 50, "0-50"),
+  c(50, 100, "50-100"),
+  c(100, NA, "100+"),
+  c(200, NA, "200+")
+  
+)
+
+
+
+
+group_intersts_order <- get_ranges_array(groups_ranges_labels)
+interests_with_groups <- process_groups_perc_2(groups_ranges_labels, interests_analysis_amount)
+interests_with_groups$range <- factor(interests_with_groups$range, levels = group_intersts_order)
+
+
+```
+
+
+
+
+```{r}
+interests_with_groups %>% filter(platform %in% c("facebook", "twitter")) %>% group_by(range, platform) %>% ungroup %>% ggplot(aes(x= range,y=val)) + geom_boxplot() + facet_wrap(~platform) + theme_bw() + labs(x="Number of interests assigned", y="User Valuation") + ylim(1,5) + theme(text = element_text(size = 15))
+```
+
+
+```{r}
+ggsave("InterestsAmountVsvaluation.pdf", width = 7, height = 4)
+```
+
+
+
+
+
+
+
+
+
+```{r}
+user_ad_valuations <- userAds_filtered %>% left_join(ads, by="ad_id") %>% filter(!is.na(valoration)) %>% group_by(user_id, platform) %>% summarise(n=n(), int_val=mean(valoration))
+
+user_interests_valuations <- interests_filtered %>% filter(platform != "garbage")  %>% mutate_cond(platform=="googleTopic", platform="google") %>% filter(!is.na(valoration)) %>% group_by(user_id, platform) %>% summarise(ad_val=mean(valoration)) 
+
+
+interests_ad_valuations <- user_ad_valuations %>% inner_join(user_interests_valuations, by=c("user_id", "platform"))
+
+```
+
+
+
+
+```{r}
+data_to_ <- classified_interests %>% group_by(user_id, platform)  %>% filter(platform %in% c("facebook", "twitter", "linkedin")) %>% summarise(totalInterests=n(), badInterests = sum(valoration <= 2))
+
+data_to_ %>% ggplot(aes(x=totalInterests, y=badInterests)) + geom_point() + facet_wrap(~platform, scales="free") +     theme_bw() + labs(x="Evaluated Interests", y="Irrelevant interests") +
+  geom_smooth(method="gam")
+
+ 
+```
+
+
+```{r}
+ggsave("evaluatedVsIrrelevant.pdf", width = 7, height = 4)
+```
+
+
+
+
+

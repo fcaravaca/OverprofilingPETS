@@ -1,0 +1,29 @@
+.grid-container {
+    display: grid;
+    grid-template-columns: auto auto auto auto;
+    padding: 10px;
+    width: 100%;
+  }
+.grid-item {
+    border: 0px solid rgba(0, 0, 0, 0.8);
+    font-size: 30px;
+    text-align: center;
+    width: 100%;
+}
+
+.ad-container {
+    position: relative;
+    display: block;
+    width: 25%;
+}
+
+.ad-container:after {
+    content: "";
+    display: block;
+    padding-bottom: 100%; /* The padding depends on the width, not on the height, so with a padding-bottom of 100% you will get a square */
+}
+
+.ad-img:hover {
+    transform: scale(1.03);
+}
+
